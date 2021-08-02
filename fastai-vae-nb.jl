@@ -1,3 +1,187 @@
+### A Pluto.jl notebook ###
+# v0.15.1
+
+using Markdown
+using InteractiveUtils
+
+# ╔═╡ 42391084-f3a5-11eb-01a1-4314211fb5cb
+begin
+	using CUDA
+	using FastAI
+	using FastAI: FluxTraining
+	using MLDataPattern
+	using Flux
+	using Flux.Zygote: Params
+	using Flux.Optimise: update!
+	using Statistics: mean
+	
+	md"""
+	# FastAI.jl VAE Demo
+	"""
+end
+
+# ╔═╡ f74f14ed-1d7a-4642-bb48-0fae0523f9e5
+md"""
+We will train a variational auto-encoder (VAE) model to encode images from the MNIST dataset to latent space, while still being able to accurately decode the latent samples.
+
+The overall pipeline looks like this:
+
+![Diagram of VAE](https://github.com/darsnack/fastai-vae-demo/raw/main/vae.png)
+
+As you can see, this is an unsupervised learning scheme, since we only need input images (no labels). Below, we'll demonstrate how FastAI.jl handles this unconventional training flow.
+"""
+
+# ╔═╡ cc363ea7-c46d-4709-92ed-fd174b2dcc30
+md"""
+## Loading the data
+
+Below, we load the MNIST dataset just like we would for supervised training. No changes required here!
+"""
+
+# ╔═╡ 75479511-cc68-4658-9d2d-feb5ada60876
+begin
+	
+path = datasetpath("mnist_png")
+data = Datasets.loadfolderdata(path,
+                               filterfn = isimagefile,
+                               splitfn = grandparentname,
+                               loadfn = (loadfile, parentname))
+trainimgs = mapobs(data["training"][1]) do img
+    reshape(Float32.(img), :)
+end
+testimgs = mapobs(data["testing"][1]) do img
+    reshape(Float32.(img), :)
+end
+
+end
+
+# ╔═╡ 034e4bb2-2b3a-49ae-a55d-3c6c840e858d
+md"""
+Next we create a VAE model composed of a two layer MLP for the encoder and decoder. Our latent space will be two dimensional (we are encoding a 28x28 image to 2D!).
+"""
+
+# ╔═╡ 491fbbbe-e57a-4966-a3f5-d16a9ab1fdf1
+Din, Dhidden, Dlatent = size(getobs(trainimgs, 1), 1), 512, 2
+
+# ╔═╡ dad931d5-77eb-4482-9600-1c9a00f3e48b
+encoder = Chain(Dense(Din, Dhidden, relu), # backbone
+                Parallel(tuple,
+                         Dense(Dhidden, Dlatent), # μ
+                         Dense(Dhidden, Dlatent)  # logσ²
+                         )) |> gpu
+
+# ╔═╡ 9c929ac3-4fc4-4538-ad13-6d9b2001a9b3
+decoder = Chain(Dense(Dlatent, Dhidden, relu), Dense(Dhidden, Din, sigmoid)) |> gpu
+
+# ╔═╡ d91a12d1-3e93-41c0-b16d-cb5c4102be38
+md"""
+We also define a custom loss function (called the ELBO) and a utility to help us sample the latent space
+"""
+
+# ╔═╡ 02641648-2539-440e-834b-5817fd7f8d36
+begin
+
+sample_latent(μ::AbstractArray{T}, logσ²::AbstractArray{T}) where T =
+    μ .+ exp.(logσ² ./ 2) .* randn(T, size(logσ²))
+	
+sample_latent(μ::CuArray{T}, logσ²::CuArray{T}) where T =
+    μ .+ exp.(logσ² ./ 2) .* gpu(randn(T, size(logσ²)))
+
+function βELBO(x, x̄, μ, logσ²; β = 1)
+    reconstruction_error = sum(@.((x̄ - x)^2))
+    # D(N(μ, Σ)||N(0, I)) = 1/2 * (μᵀμ + tr(Σ) - length(μ) - log(|Σ|))
+    kl_divergence = mean(sum(@.((μ^2 + exp(logσ²) - 1 - logσ²) / 2); dims = 1))
+
+    return reconstruction_error + β * kl_divergence
+end
+
+end
+
+# ╔═╡ e093b91d-3471-4006-8db7-0caa0cb31ec8
+md"""
+## Creating a `Learner`
+
+Now we instantiate FastAI.jl's `Learner` which encapsulates our training data, model, loss function, and optimizer. Notice that we didn't do anything special for our data, model, or loss that wasn't present in an image classification example.
+"""
+
+# ╔═╡ d6afd08f-b55b-4be5-b840-8024baa4814a
+begin
+	
+model = (encoder = encoder, decoder = decoder)
+opt = Flux.Optimiser(Momentum(1e-4), WeightDecay(1e-4))
+learner = Learner(model, (training = eachbatch(trainimgs, 32),), opt, βELBO)
+	
+end
+
+# ╔═╡ d7db1be3-a3b1-41cd-acce-9b11c25bfeca
+md"""
+## Custom training loop
+
+When dealing with a unconvential learning scheme, we usually need to write a custom training loop. FastAI.jl is build on top of FluxTraining.jl which makes writing custom loops easy. In fact, the built-in learning schemes use the _exact_ same framework as you'll see below.
+"""
+
+# ╔═╡ 441590cc-c230-481a-9e23-2cd5de5ad408
+struct VAETrainingPhase <: FluxTraining.AbstractTrainingPhase end
+
+# ╔═╡ c2e32306-af12-44ad-8f19-626cbe4f51fa
+md"""
+We just defined our own training phase. All that's required for our phase to take advantage of the FastAI.jl framework is to define the `FluxTraining.step!` function. We'll use a utility, `FluxTraining.runstep`, to make handling callback events, etc. simple. `runstep`'s first argument is a function with inputs `(handle, state)`. `handle` is how we indicate different events, such as the start of the gradient computation, to FluxTraining's loop system. `state` holds data generated on each call to `step!` like the batch, gradients, and loss. We initialize it to contain our batch: `(x = batch,)`.
+"""
+
+# ╔═╡ e4206e9c-5b52-4690-a8ae-80e389e7a8c0
+function FluxTraining.step!(learner, phase::VAETrainingPhase, batch)
+    FluxTraining.runstep(learner, phase, (x = batch,)) do handle, state
+        ps = union(learner.params...)
+        x = gpu(reduce(hcat, state.x))
+        gs = gradient(ps) do
+            # get encode, sample latent space, decode
+            μ, logσ² = learner.model.encoder(x)
+            z = sample_latent(μ, logσ²)
+            x̄ = learner.model.decoder(z)
+
+            handle(FluxTraining.LossBegin())
+            state.loss = learner.lossfn(x, x̄, μ, logσ²)
+
+            handle(FluxTraining.BackwardBegin())
+            return state.loss
+        end
+        handle(FluxTraining.BackwardEnd())
+        state.grads = (encoder = [gs[p] for p in learner.params.encoder],
+                       decoder = [gs[p] for p in learner.params.decoder])
+        update!(learner.optimizer, ps, gs)
+    end
+end
+
+# ╔═╡ 0b075e42-4b98-4fed-8ac3-e1256e08c44d
+md"""
+## Training the model
+
+And that's it! We can now train our model like any other `Learner` in FastAI.jl. We just need to specify that the `VAETrainingPhase` should be run instead of the default `FluxTraining.TrainingPhase`.
+"""
+
+# ╔═╡ 39e26939-0fa9-4217-b626-1574bf9f47b1
+for epoch in 1:50
+    epoch!(learner, VAETrainingPhase())
+end
+
+# ╔═╡ 00000000-0000-0000-0000-000000000001
+PLUTO_PROJECT_TOML_CONTENTS = """
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+FastAI = "5d0beca9-ade8-49ae-ad0b-a3cf890e669f"
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+MLDataPattern = "9920b226-0b2a-5f5f-9153-9aa70a013f8b"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[compat]
+CUDA = "~3.3.4"
+FastAI = "~0.1.0"
+Flux = "~0.12.6"
+MLDataPattern = "~0.5.4"
+"""
+
+# ╔═╡ 00000000-0000-0000-0000-000000000002
+PLUTO_MANIFEST_TOML_CONTENTS = """
 # This file is machine-generated - editing it directly is not advised
 
 [[AbstractFFTs]]
@@ -192,12 +376,6 @@ git-tree-sha1 = "52cb3ec90e8a8bea0e62e275ba577ad0f74821f7"
 uuid = "ed09eef8-17a6-5b46-8889-db040fac31e3"
 version = "0.3.2"
 
-[[Configurations]]
-deps = ["Crayons", "ExproniconLite", "OrderedCollections", "TOML"]
-git-tree-sha1 = "b8486a417456d2fbbe2af13e24cef459c9f42429"
-uuid = "5218b696-f38b-4ac9-8b61-a12ec717816d"
-version = "0.15.4"
-
 [[ConstructionBase]]
 deps = ["LinearAlgebra"]
 git-tree-sha1 = "f74e9d5388b8620b4cee35d4c5a618dd4dc547f4"
@@ -347,11 +525,6 @@ git-tree-sha1 = "b7e3d17636b348f005f11040025ae8c6f645fe92"
 uuid = "e2ba6199-217a-4e67-a87a-7c52f15ade04"
 version = "0.1.6"
 
-[[ExproniconLite]]
-git-tree-sha1 = "c97ce5069033ac15093dc44222e3ecb0d3af8966"
-uuid = "55351af7-c7e9-48d6-89ff-24e801d99491"
-version = "0.6.9"
-
 [[FFMPEG]]
 deps = ["FFMPEG_jll"]
 git-tree-sha1 = "b57e3acbe22f8484b4b5ff66a7499717fe1a9cc8"
@@ -399,9 +572,6 @@ deps = ["Dates", "Mmap", "Printf", "Test", "UUIDs"]
 git-tree-sha1 = "0f5e8d0cb91a6386ba47bd1527b240bd5725fbae"
 uuid = "48062228-2e41-5def-b9a4-89aafe57970f"
 version = "0.9.10"
-
-[[FileWatching]]
-uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
 
 [[FillArrays]]
 deps = ["LinearAlgebra", "Random", "SparseArrays", "Statistics"]
@@ -478,12 +648,6 @@ version = "0.2.3"
 [[Future]]
 deps = ["Random"]
 uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
-
-[[FuzzyCompletions]]
-deps = ["REPL"]
-git-tree-sha1 = "9cde086faa37f32794be3d2df393ff064d43cd66"
-uuid = "fb4132e2-a121-4a70-b8a1-d5b831dcdcc2"
-version = "0.4.1"
 
 [[GPUArrays]]
 deps = ["AbstractFFTs", "Adapt", "LinearAlgebra", "Printf", "Random", "Serialization", "Statistics"]
@@ -967,12 +1131,6 @@ version = "0.3.3"
 [[MozillaCACerts_jll]]
 uuid = "14a3606d-f60d-562e-9121-12d972cd8159"
 
-[[MsgPack]]
-deps = ["Serialization"]
-git-tree-sha1 = "a8cbf066b54d793b9a48c5daa5d586cf2b5bd43d"
-uuid = "99f44e22-a591-53d1-9472-aa23ef4bd671"
-version = "1.1.0"
-
 [[NNlib]]
 deps = ["Adapt", "ChainRulesCore", "Compat", "LinearAlgebra", "Pkg", "Requires", "Statistics"]
 git-tree-sha1 = "d27c8947dab6e3a315f6dcd4d2493ed3ba541791"
@@ -1114,18 +1272,6 @@ deps = ["ColorSchemes", "Colors", "Dates", "Printf", "Random", "Reexport", "Stat
 git-tree-sha1 = "501c20a63a34ac1d015d5304da0e645f42d91c9f"
 uuid = "995b91a9-d308-5afd-9ec6-746e21dbc043"
 version = "1.0.11"
-
-[[Pluto]]
-deps = ["Base64", "Configurations", "Dates", "Distributed", "FileWatching", "FuzzyCompletions", "HTTP", "InteractiveUtils", "Logging", "Markdown", "MsgPack", "Pkg", "REPL", "Sockets", "TableIOInterface", "Tables", "UUIDs"]
-git-tree-sha1 = "6af6088f72ae82c8b6712047b5fe79c22016b878"
-uuid = "c3e4b0f8-55cb-11ea-2926-15256bba5781"
-version = "0.15.1"
-
-[[PlutoUI]]
-deps = ["Base64", "Dates", "InteractiveUtils", "JSON", "Logging", "Markdown", "Random", "Reexport", "Suppressor"]
-git-tree-sha1 = "44e225d5837e2a2345e69a1d1e01ac2443ff9fcb"
-uuid = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
-version = "0.7.9"
 
 [[PolygonOps]]
 git-tree-sha1 = "c031d2332c9a8e1c90eca239385815dc271abb22"
@@ -1364,11 +1510,6 @@ version = "0.6.0"
 deps = ["Libdl", "LinearAlgebra", "Serialization", "SparseArrays"]
 uuid = "4607b0f0-06f3-5cda-b6b1-a6196a1729e9"
 
-[[Suppressor]]
-git-tree-sha1 = "a819d77f31f83e5792a76081eee1ea6342ab8787"
-uuid = "fd094767-a336-5f1f-9728-57cf17d0bbfb"
-version = "0.2.0"
-
 [[SweepOperator]]
 deps = ["LinearAlgebra"]
 git-tree-sha1 = "20da2784e79fc0bfdd70592d1b47d7a6034e82d1"
@@ -1378,11 +1519,6 @@ version = "0.3.0"
 [[TOML]]
 deps = ["Dates"]
 uuid = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
-
-[[TableIOInterface]]
-git-tree-sha1 = "9a0d3ab8afd14f33a35af7391491ff3104401a35"
-uuid = "d1efa939-5518-4425-949f-ab857e148477"
-version = "0.1.6"
 
 [[TableTraits]]
 deps = ["IteratorInterfaceExtensions"]
@@ -1624,3 +1760,26 @@ deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
 git-tree-sha1 = "ee567a171cce03570d77ad3a43e90218e38937a9"
 uuid = "dfaa095f-4041-5dcd-9319-2fabd8486b76"
 version = "3.5.0+0"
+"""
+
+# ╔═╡ Cell order:
+# ╟─42391084-f3a5-11eb-01a1-4314211fb5cb
+# ╟─f74f14ed-1d7a-4642-bb48-0fae0523f9e5
+# ╟─cc363ea7-c46d-4709-92ed-fd174b2dcc30
+# ╠═75479511-cc68-4658-9d2d-feb5ada60876
+# ╟─034e4bb2-2b3a-49ae-a55d-3c6c840e858d
+# ╠═491fbbbe-e57a-4966-a3f5-d16a9ab1fdf1
+# ╠═dad931d5-77eb-4482-9600-1c9a00f3e48b
+# ╠═9c929ac3-4fc4-4538-ad13-6d9b2001a9b3
+# ╟─d91a12d1-3e93-41c0-b16d-cb5c4102be38
+# ╠═02641648-2539-440e-834b-5817fd7f8d36
+# ╟─e093b91d-3471-4006-8db7-0caa0cb31ec8
+# ╠═d6afd08f-b55b-4be5-b840-8024baa4814a
+# ╟─d7db1be3-a3b1-41cd-acce-9b11c25bfeca
+# ╠═441590cc-c230-481a-9e23-2cd5de5ad408
+# ╟─c2e32306-af12-44ad-8f19-626cbe4f51fa
+# ╠═e4206e9c-5b52-4690-a8ae-80e389e7a8c0
+# ╟─0b075e42-4b98-4fed-8ac3-e1256e08c44d
+# ╠═39e26939-0fa9-4217-b626-1574bf9f47b1
+# ╟─00000000-0000-0000-0000-000000000001
+# ╟─00000000-0000-0000-0000-000000000002

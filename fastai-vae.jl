@@ -12,8 +12,12 @@ using Statistics: mean
 path = datasetpath("mnist_png")
 data = Datasets.loadfolderdata(path,
                                filterfn = isimagefile,
+                               splitfn = grandparentname,
                                loadfn = (loadfile, parentname))
-imgs = mapobs(data[1]) do img
+trainimgs = mapobs(data["training"][1]) do img
+    reshape(Float32.(img), :)
+end
+testimgs = mapobs(data["testing"][1]) do img
     reshape(Float32.(img), :)
 end
 
